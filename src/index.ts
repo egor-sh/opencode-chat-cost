@@ -1,5 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
+import { z } from "zod"
 
 export type ChatCostOptions = {
   /** Цена за 1M input-токенов, руб. */
@@ -78,7 +79,21 @@ async function collectStats(
     query: { directory },
   })
   const messages: Array<{ info: any; parts: any[] }> = res.data ?? res
+  return computeStats(messages)
+}
 
+/** V2: история сессии через ctx.session.context. */
+async function collectStatsV2(ctx: any, sessionID: string): Promise<SessionStats> {
+  const res = await ctx.session.context({ sessionID })
+  const raw = res?.messages ?? res?.data ?? res
+  const list = Array.isArray(raw) ? raw : raw?.messages ?? []
+  const messages: Array<{ info: any; parts: any[] }> = list.map((m: any) =>
+    Array.isArray(m) ? { info: m[0], parts: m[1] ?? [] } : { info: m.info ?? m, parts: m.parts ?? [] },
+  )
+  return computeStats(messages)
+}
+
+function computeStats(messages: Array<{ info: any; parts: any[] }>): SessionStats {
   const stats: SessionStats = {
     tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
     prompts: [],
@@ -182,9 +197,30 @@ function buildReport(stats: SessionStats, options: ChatCostOptions): string {
   return lines.join("\n")
 }
 
-const ChatCostPlugin: Plugin = async (input, options) => {
-  // Цены задаются либо в опциях плагина (формат ["путь", { ... }] в opencode.json),
-  // либо в файле chat-cost.json рядом с index.ts — на случай, если сборка не передаёт options.
+const TOOL_DESCRIPTION =
+  "Считает токены и стоимость текущего чата (по ценам из настроек плагина) и собирает материал о проделанной работе: запросы пользователя и затронутые файлы. Возвращает markdown с таблицей токенов, блоком стоимости и служебным материалом для описания."
+
+const COMMAND_DESCRIPTION =
+  "Токены и стоимость (₽) чата + краткое описание работ. Опционально: ключ задачи Jira в аргументе, например PROJ-123"
+
+function commandTemplate(argumentsHint: string): string {
+  return [
+    "Вызови инструмент `chat_cost` для текущей сессии.",
+    "Выведи пользователю: таблицу токенов и блок стоимости из ответа инструмента как есть (markdown).",
+    "Затем на основе раздела «Материал для описания работ» напиши связное описание выполненной работы в 1–3 предложениях — не перечисляй запросы и инструменты по номерам.",
+    "",
+    "Дальше — про Jira:",
+    "- Если в аргументах команды указан ключ задачи (например `" + argumentsHint + "`) — предложи прикрепить комментарий к этой задаче.",
+    "- Если аргументов нет — поищи ключ задачи Jira (формат ABC-123) в запросах пользователя из материала и в истории текущего чата. Если нашёл — предложи прикрепить комментарий к этой же задаче.",
+    "- Если ключ не нашёлся — спроси пользователя, к какой задаче Jira отправить комментарий.",
+    "",
+    "ВАЖНО: комментарий в Jira самостоятельно не публикуй. Сначала предложи задачу и покажи, какой текст будет отправлен, и дождись явного подтверждения пользователя. Только после подтверждения опубликуй отчёт как комментарий через MCP-сервер atlassian (инструмент jira add comment). Если MCP atlassian недоступен — сообщи об этом.",
+  ].join("\n")
+}
+
+// Цены задаются либо в опциях плагина (формат ["путь", { ... }] в opencode.json),
+// либо в файле chat-cost.json рядом с index.ts — на случай, если сборка не передаёт options.
+async function resolveOptions(inline?: ChatCostOptions): Promise<ChatCostOptions> {
   let fileOptions: ChatCostOptions = {}
   try {
     const srcDir = new URL(".", import.meta.url).pathname
@@ -200,7 +236,11 @@ const ChatCostPlugin: Plugin = async (input, options) => {
   } catch {
     // Bun недоступен — цены только из options или не заданы
   }
-  const opts: ChatCostOptions = { ...fileOptions, ...(options ?? {}) }
+  return { ...fileOptions, ...(inline ?? {}) }
+}
+
+const ChatCostPlugin: Plugin = async (input, options) => {
+  const opts = await resolveOptions(options as ChatCostOptions | undefined)
   const client: any = input.client
   const directory = input.directory
 
@@ -208,27 +248,14 @@ const ChatCostPlugin: Plugin = async (input, options) => {
     config: (config) => {
       config.command = config.command ?? {}
       config.command["otchet"] = {
-        description:
-          "Токены и стоимость (₽) чата + краткое описание работ. Опционально: ключ задачи Jira в аргументе, например PROJ-123",
-        template: [
-          "Вызови инструмент `chat_cost` для текущей сессии.",
-          "Выведи пользователю: таблицу токенов и блок стоимости из ответа инструмента как есть (markdown).",
-          "Затем на основе раздела «Материал для описания работ» напиши связное описание выполненной работы в 1–3 предложениях — не перечисляй запросы и инструменты по номерам.",
-          "",
-          "Дальше — про Jira:",
-          "- Если в аргументах команды указан ключ задачи (например `$ARGUMENTS`) — предложи прикрепить комментарий к этой задаче.",
-          "- Если аргументов нет — поищи ключ задачи Jira (формат ABC-123) в запросах пользователя из материала и в истории текущего чата. Если нашёл — предложи прикрепить комментарий к этой же задаче.",
-          "- Если ключ не нашёлся — спроси пользователя, к какой задаче Jira отправить комментарий.",
-          "",
-          "ВАЖНО: комментарий в Jira самостоятельно не публикуй. Сначала предложи задачу и покажи, какой текст будет отправлен, и дождись явного подтверждения пользователя. Только после подтверждения опубликуй отчёт как комментарий через MCP-сервер atlassian (инструмент jira add comment). Если MCP atlassian недоступен — сообщи об этом.",
-        ].join("\n"),
+        description: COMMAND_DESCRIPTION,
+        template: commandTemplate("$ARGUMENTS"),
         agent: "build",
       }
     },
     tool: {
       chat_cost: tool({
-        description:
-          "Считает токены и стоимость текущего чата (по ценам из настроек плагина) и собирает материал о проделанной работе: запросы пользователя и затронутые файлы. Возвращает markdown с таблицей токенов, блоком стоимости и служебным материалом для описания.",
+        description: TOOL_DESCRIPTION,
         args: {},
         async execute(_args, context) {
           const stats = await collectStats(client, context.sessionID, directory)
@@ -239,4 +266,48 @@ const ChatCostPlugin: Plugin = async (input, options) => {
   }
 }
 
-export default ChatCostPlugin
+/**
+ * V2 (opencode ≥ 2.x): контракт default-экспорта — объект { id, setup }.
+ * Всё регистрируется через ctx-домены; возвращаемый объект хуков не используется.
+ */
+async function v2Setup(ctx: any) {
+  const opts = await resolveOptions(ctx?.options)
+
+  await ctx.tool.transform((editor: any) => {
+    editor.add({
+      name: "chat_cost",
+      description: TOOL_DESCRIPTION,
+      input: z.object({}),
+      execute: async (_input: any, toolCtx: any) => {
+        const stats = await collectStatsV2(ctx, toolCtx.sessionID)
+        return { content: buildReport(stats, opts) }
+      },
+    })
+  })
+
+  await ctx.command.transform((editor: any) => {
+    editor.add({
+      name: "otchet",
+      description: COMMAND_DESCRIPTION,
+      execute: async ({ sessionID, prompt, delivery }: any) => {
+        const args = typeof prompt?.text === "string" ? prompt.text.trim() : ""
+        await ctx.session.prompt({
+          sessionID,
+          delivery,
+          text: commandTemplate(args ? `аргументы: ${args}` : "$ARGUMENTS"),
+        })
+      },
+    })
+  })
+}
+
+/**
+ * Единый экспорт для обеих версий opencode:
+ * - V1 (1.x): читает { id, server } и вызывает server(input, options) → хуки { config, tool }
+ * - V2 (2.x): читает { id, setup } и вызывает setup(ctx); лишнее свойство server игнорируется схемой
+ */
+export default {
+  id: "opencode-chat-cost",
+  server: ChatCostPlugin,
+  setup: v2Setup,
+}

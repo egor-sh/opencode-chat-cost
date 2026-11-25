@@ -1,6 +1,6 @@
 {
   "name": "opencode-chat-cost",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "OpenCode plugin: token usage, RUB cost by configurable rates, and a work summary for each chat",
   "type": "module",
   "main": "src/index.ts",
@@ -12,7 +12,7 @@
     }
   },
   "scripts": {
-    "check": "tsgo --noEmit || true"
+    "typecheck": "tsc --noEmit"
   },
   "keywords": [
     "opencode",
@@ -22,7 +22,8 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@opencode-ai/plugin": "1.14.29"
+    "@opencode-ai/plugin": "1.14.29",
+    "zod": "^4.1.0"
   },
   "devDependencies": {
     "typescript": "^5.7.0"
