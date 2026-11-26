@@ -1,4 +1,8 @@
 {
-  "inputPrice": 500,
-  "outputPrice": 2000
+  "currency": "₽",
+  "default": { "inputPrice": 500, "outputPrice": 2000 },
+  "models": {
+    "alfagen/VIP-Ext-MMB-Cross-GLM-5.3-Flash": { "inputPrice": 500, "outputPrice": 2000 },
+    "*": { "inputPrice": 100, "outputPrice": 400 }
+  }
 }

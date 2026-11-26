@@ -2,17 +2,12 @@ import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { z } from "zod"
 
-export type ChatCostOptions = {
-  /** Цена за 1M input-токенов, руб. */
+/** Цены одной модели (или default). Руб. за 1M токенов. */
+export type ModelPrices = {
   inputPrice?: number
-  /** Цена за 1M output-токенов (включая reasoning), руб. */
   outputPrice?: number
-  /** Цена за 1M cache read-токенов, руб. */
   cacheReadPrice?: number
-  /** Цена за 1M cache write-токенов, руб. */
   cacheWritePrice?: number
-  /** Символ валюты для отчёта */
-  currency?: string
 }
 
 type Tokens = {
@@ -23,14 +18,26 @@ type Tokens = {
   cacheWrite: number
 }
 
+type ModelUsage = Tokens & { providerID: string; modelID: string }
+
 type SessionStats = {
   tokens: Tokens
+  perModel: ModelUsage[]
   prompts: string[]
   tools: Record<string, number>
   files: Set<string>
   messages: number
   turns: number
 }
+
+/** Формат chat-cost.json: цены по моделям + default; старый плоский формат тоже читается. */
+type PriceConfig = {
+  currency?: string
+  default?: ModelPrices
+  models?: Record<string, ModelPrices>
+} & ModelPrices
+
+const ZERO: Tokens = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }
 
 function fmt(n: number): string {
   return n.toLocaleString("ru-RU", { maximumFractionDigits: 0 })
@@ -69,6 +76,31 @@ function isUserCommandNoise(text: string): boolean {
   return text.trim().length === 0
 }
 
+/** Цена для конкретной модели: точное "provider/model" → "model" → "*" → default. */
+function priceFor(
+  config: PriceConfig,
+  providerID: string,
+  modelID: string,
+): ModelPrices | undefined {
+  const models = config.models ?? {}
+  const direct = models[`${providerID}/${modelID}`] ?? models[modelID]
+  if (direct) return direct
+  return models["*"] ?? config.default
+}
+
+function hasAnyPrice(p?: ModelPrices): boolean {
+  return !!p && (p.inputPrice != null || p.outputPrice != null || p.cacheReadPrice != null || p.cacheWritePrice != null)
+}
+
+function costOf(t: Tokens, p: ModelPrices): number {
+  return (
+    (t.input / 1e6) * (p.inputPrice ?? 0) +
+    (t.output / 1e6) * (p.outputPrice ?? 0) +
+    (t.cacheRead / 1e6) * (p.cacheReadPrice ?? 0) +
+    (t.cacheWrite / 1e6) * (p.cacheWritePrice ?? 0)
+  )
+}
+
 async function collectStats(
   client: any,
   sessionID: string,
@@ -95,13 +127,15 @@ async function collectStatsV2(ctx: any, sessionID: string): Promise<SessionStats
 
 function computeStats(messages: Array<{ info: any; parts: any[] }>): SessionStats {
   const stats: SessionStats = {
-    tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+    tokens: { ...ZERO },
+    perModel: [],
     prompts: [],
     tools: {},
     files: new Set(),
     messages: 0,
     turns: 0,
   }
+  const byModel = new Map<string, ModelUsage>()
 
   for (const { info, parts } of messages) {
     stats.messages++
@@ -112,6 +146,20 @@ function computeStats(messages: Array<{ info: any; parts: any[] }>): SessionStat
       stats.tokens.reasoning += t.reasoning ?? 0
       stats.tokens.cacheRead += t.cache?.read ?? 0
       stats.tokens.cacheWrite += t.cache?.write ?? 0
+
+      const providerID = String(info.providerID ?? "unknown")
+      const modelID = String(info.modelID ?? "unknown")
+      const key = `${providerID}/${modelID}`
+      let usage = byModel.get(key)
+      if (!usage) {
+        usage = { ...ZERO, providerID, modelID }
+        byModel.set(key, usage)
+      }
+      usage.input += t.input ?? 0
+      usage.output += t.output ?? 0
+      usage.reasoning += t.reasoning ?? 0
+      usage.cacheRead += t.cache?.read ?? 0
+      usage.cacheWrite += t.cache?.write ?? 0
     }
     if (info?.role === "user") {
       stats.turns++
@@ -132,11 +180,14 @@ function computeStats(messages: Array<{ info: any; parts: any[] }>): SessionStat
       if (file) stats.files.add(file)
     }
   }
+  stats.perModel = Array.from(byModel.values()).sort((a, b) =>
+    `${a.providerID}/${a.modelID}`.localeCompare(`${b.providerID}/${b.modelID}`),
+  )
   return stats
 }
 
-function buildReport(stats: SessionStats, options: ChatCostOptions): string {
-  const cur = options.currency ?? "₽"
+function buildReport(stats: SessionStats, config: PriceConfig): string {
+  const cur = config.currency ?? "₽"
   const lines: string[] = []
 
   lines.push("## Токены и стоимость чата")
@@ -148,29 +199,47 @@ function buildReport(stats: SessionStats, options: ChatCostOptions): string {
   lines.push(`| Cache read | ${fmt(stats.tokens.cacheRead)} |`)
   lines.push(`| Cache write | ${fmt(stats.tokens.cacheWrite)} |`)
 
-  const hasPrice =
-    options.inputPrice != null ||
-    options.outputPrice != null ||
-    options.cacheReadPrice != null ||
-    options.cacheWritePrice != null
-  if (hasPrice) {
-    const input = ((stats.tokens.input / 1e6) * (options.inputPrice ?? 0))
-    const output = ((stats.tokens.output / 1e6) * (options.outputPrice ?? 0))
-    const cacheRead = ((stats.tokens.cacheRead / 1e6) * (options.cacheReadPrice ?? 0))
-    const cacheWrite = ((stats.tokens.cacheWrite / 1e6) * (options.cacheWritePrice ?? 0))
-    const total = input + output + cacheRead + cacheWrite
+  // Разбивка по моделям
+  if (stats.perModel.length > 0) {
     lines.push("")
-    lines.push("**Расход, " + cur + "** (цены заданы в настройках плагина):")
-    if (options.inputPrice != null) lines.push(`- input: ${money(input, cur)}`)
-    if (options.outputPrice != null) lines.push(`- output: ${money(output, cur)}`)
-    if (options.cacheReadPrice != null) lines.push(`- cache read: ${money(cacheRead, cur)}`)
-    if (options.cacheWritePrice != null) lines.push(`- cache write: ${money(cacheWrite, cur)}`)
-    lines.push(`- **итого: ${money(total, cur)}**`)
-  } else {
+    lines.push("**По моделям:**")
     lines.push("")
-    lines.push(
-      "_Цены не заданы — стоимость не считается. Укажите inputPrice/outputPrice (руб. за 1M токенов) в опциях плагина._",
-    )
+    lines.push("| Модель | Input | Output | Cache read | Cache write | Стоимость |")
+    lines.push("|---|---:|---:|---:|---:|---:|")
+    const unpriced: string[] = []
+    let total = 0
+    for (const u of stats.perModel) {
+      const key = `${u.providerID}/${u.modelID}`
+      const p = priceFor(config, u.providerID, u.modelID)
+      if (!hasAnyPrice(p)) {
+        unpriced.push(key)
+        lines.push(
+          `| ${key} | ${fmt(u.input)} | ${fmt(u.output)} | ${fmt(u.cacheRead)} | ${fmt(u.cacheWrite)} | — |`,
+        )
+        continue
+      }
+      const cost = costOf(u, p as ModelPrices)
+      total += cost
+      lines.push(
+        `| ${key} | ${fmt(u.input)} | ${fmt(u.output)} | ${fmt(u.cacheRead)} | ${fmt(u.cacheWrite)} | ${money(cost, cur)} |`,
+      )
+    }
+    if (unpriced.length > 0) {
+      lines.push(`| **итого (модели с ценами)** | | | | | **${money(total, cur)}** |`)
+    } else {
+      lines.push(`| **итого** | | | | | **${money(total, cur)}** |`)
+    }
+
+    // Служебный маркер для модели: какие модели без цен
+    if (unpriced.length > 0) {
+      lines.push("")
+      lines.push(
+        "## Модели без цены (служебное)\n\n" +
+          "Для следующих моделей цены не заданы: " +
+          unpriced.join(", ") +
+          ".",
+      )
+    }
   }
 
   // Черновой материал — модель на его основе пишет связное описание, как есть не выводить
@@ -198,16 +267,24 @@ function buildReport(stats: SessionStats, options: ChatCostOptions): string {
 }
 
 const TOOL_DESCRIPTION =
-  "Считает токены и стоимость текущего чата (по ценам из настроек плагина) и собирает материал о проделанной работе: запросы пользователя и затронутые файлы. Возвращает markdown с таблицей токенов, блоком стоимости и служебным материалом для описания."
+  "Считает токены и стоимость текущего чата по моделям (цены из chat-cost.json / опций плагина) и собирает материал о проделанной работе: запросы пользователя и затронутые файлы. Возвращает markdown: таблица токенов, разбивка по моделям со стоимостью, список моделей без цены, служебный материал для описания."
+
+const SET_PRICES_DESCRIPTION =
+  "Сохраняет цены токенов (руб. за 1M) для модели в chat-cost.json плагина. Вызывайте после того, как пользователь сообщил цены. model — ключ модели: \"providerID/modelID\" или просто \"modelID\"; \"*\" — цены по умолчанию для всех моделей без своей записи."
 
 const COMMAND_DESCRIPTION =
-  "Токены и стоимость (₽) чата + краткое описание работ. Опционально: ключ задачи Jira в аргументе, например PROJ-123"
+  "Токены и стоимость (₽) чата по моделям + краткое описание работ. Опционально: ключ задачи Jira в аргументе, например PROJ-123"
 
 function commandTemplate(argumentsHint: string): string {
   return [
     "Вызови инструмент `chat_cost` для текущей сессии.",
-    "Выведи пользователю: таблицу токенов и блок стоимости из ответа инструмента как есть (markdown).",
+    "Выведи пользователю: таблицу токенов и разбивку по моделям из ответа инструмента как есть (markdown).",
     "Затем на основе раздела «Материал для описания работ» напиши связное описание выполненной работы в 1–3 предложениях — не перечисляй запросы и инструменты по номерам.",
+    "",
+    "Если в ответе есть раздел «Модели без цены» — это модели, для которых стоимость посчитать нельзя:",
+    "- Спроси у пользователя цены input и output (руб. за 1M токенов) для каждой из этих моделей. Кэш-цены спрашивай, только если пользователь сам про них упомянул.",
+    "- Получив цены, вызови `chat_cost_set_prices` для каждой модели (model — ключ из раздела), затем вызови `chat_cost` заново и выведи обновлённый отчёт.",
+    "- Если пользователь не хочет называть цены — просто сообщи, что стоимость этих моделей не считается.",
     "",
     "Дальше — про Jira:",
     "- Если в аргументах команды указан ключ задачи (например `" + argumentsHint + "`) — предложи прикрепить комментарий к этой задаче.",
@@ -220,14 +297,14 @@ function commandTemplate(argumentsHint: string): string {
 
 // Цены задаются либо в опциях плагина (формат ["путь", { ... }] в opencode.json),
 // либо в файле chat-cost.json рядом с index.ts — на случай, если сборка не передаёт options.
-async function resolveOptions(inline?: ChatCostOptions): Promise<ChatCostOptions> {
-  let fileOptions: ChatCostOptions = {}
+async function readPriceConfig(inline?: any): Promise<PriceConfig> {
+  let fileConfig: PriceConfig = {}
   try {
     const srcDir = new URL(".", import.meta.url).pathname
     const rootDir = new URL("../", import.meta.url).pathname
     for (const dir of [srcDir, rootDir]) {
       try {
-        fileOptions = JSON.parse(await Bun.file(dir + "chat-cost.json").text())
+        fileConfig = JSON.parse(await Bun.file(dir + "chat-cost.json").text())
         break
       } catch {
         // нет в этом каталоге — пробуем следующий
@@ -236,11 +313,84 @@ async function resolveOptions(inline?: ChatCostOptions): Promise<ChatCostOptions
   } catch {
     // Bun недоступен — цены только из options или не заданы
   }
-  return { ...fileOptions, ...(inline ?? {}) }
+  // Старый плоский формат {inputPrice, ...} = цены по умолчанию для всех моделей
+  const legacy: ModelPrices = {
+    inputPrice: fileConfig.inputPrice,
+    outputPrice: fileConfig.outputPrice,
+    cacheReadPrice: fileConfig.cacheReadPrice,
+    cacheWritePrice: fileConfig.cacheWritePrice,
+  }
+  const config: PriceConfig = {
+    currency: fileConfig.currency,
+    default: { ...legacy, ...(fileConfig.default ?? {}) },
+    models: fileConfig.models ?? {},
+    ...flatPrices(inline),
+  }
+  if (inline?.currency) config.currency = inline.currency
+  return config
+}
+
+function flatPrices(src?: ModelPrices): PriceConfig {
+  if (!src) return {}
+  const has = hasAnyPrice(src)
+  return has ? { default: { ...src } } : {}
+}
+
+/** Каталог, в который пишем chat-cost.json: предпочитаем уже существующий файл, иначе корень плагина. */
+async function priceFileCandidates(): Promise<string[]> {
+  const srcDir = new URL(".", import.meta.url).pathname
+  const rootDir = new URL("../", import.meta.url).pathname
+  const candidates = [rootDir + "chat-cost.json", srcDir + "chat-cost.json"]
+  for (const c of candidates) {
+    try {
+      if (await Bun.file(c).exists()) return [c]
+    } catch {}
+  }
+  return [candidates[0]]
+}
+
+const setPricesArgs = {
+  model: z
+    .string()
+    .describe('Ключ модели: "providerID/modelID" или "modelID"; "*" — по умолчанию для всех моделей'),
+  inputPrice: z.number().describe("Руб. за 1M input-токенов"),
+  outputPrice: z.number().describe("Руб. за 1M output-токенов"),
+  cacheReadPrice: z.number().optional().describe("Руб. за 1M cache read-токенов (опционально)"),
+  cacheWritePrice: z.number().optional().describe("Руб. за 1M cache write-токенов (опционально)"),
+}
+
+async function savePrices(args: {
+  model: string
+  inputPrice: number
+  outputPrice: number
+  cacheReadPrice?: number
+  cacheWritePrice?: number
+}): Promise<string> {
+  const files = await priceFileCandidates()
+  let config: any = {}
+  try {
+    config = JSON.parse(await Bun.file(files[0]).text())
+  } catch {
+    config = {}
+  }
+  // Старый плоский формат переносим в default, чтобы не потерять
+  if (config.inputPrice != null || config.outputPrice != null) {
+    config.default = { ...config.default, inputPrice: config.inputPrice, outputPrice: config.outputPrice, cacheReadPrice: config.cacheReadPrice, cacheWritePrice: config.cacheWritePrice }
+    delete config.inputPrice
+    delete config.outputPrice
+    delete config.cacheReadPrice
+    delete config.cacheWritePrice
+  }
+  config.models = config.models ?? {}
+  const entry: ModelPrices = { inputPrice: args.inputPrice, outputPrice: args.outputPrice }
+  if (args.cacheReadPrice != null) entry.cacheReadPrice = args.cacheReadPrice
+  if (args.cacheWritePrice != null) entry.cacheWritePrice = args.cacheWritePrice
+  config.models[args.model] = entry
+  await Bun.write(files[0], JSON.stringify(config, null, 2) + "\n")
+  return `Цены для ${args.model} сохранены в ${files[0]}. Вызови chat_cost заново и покажи обновлённый отчёт.`
 }
 
 const ChatCostPlugin: Plugin = async (input, options) => {
-  const opts = await resolveOptions(options as ChatCostOptions | undefined)
   const client: any = input.client
   const directory = input.directory
 
@@ -258,8 +408,16 @@ const ChatCostPlugin: Plugin = async (input, options) => {
         description: TOOL_DESCRIPTION,
         args: {},
         async execute(_args, context) {
+          const config = await readPriceConfig(options)
           const stats = await collectStats(client, context.sessionID, directory)
-          return buildReport(stats, opts)
+          return buildReport(stats, config)
+        },
+      }),
+      chat_cost_set_prices: tool({
+        description: SET_PRICES_DESCRIPTION,
+        args: setPricesArgs,
+        async execute(args: any) {
+          return savePrices(args)
         },
       }),
     },
@@ -271,16 +429,23 @@ const ChatCostPlugin: Plugin = async (input, options) => {
  * Всё регистрируется через ctx-домены; возвращаемый объект хуков не используется.
  */
 async function v2Setup(ctx: any) {
-  const opts = await resolveOptions(ctx?.options)
-
   await ctx.tool.transform((editor: any) => {
     editor.add({
       name: "chat_cost",
       description: TOOL_DESCRIPTION,
       input: z.object({}),
       execute: async (_input: any, toolCtx: any) => {
+        const config = await readPriceConfig(ctx?.options)
         const stats = await collectStatsV2(ctx, toolCtx.sessionID)
-        return { content: buildReport(stats, opts) }
+        return { content: buildReport(stats, config) }
+      },
+    })
+    editor.add({
+      name: "chat_cost_set_prices",
+      description: SET_PRICES_DESCRIPTION,
+      input: z.object(setPricesArgs),
+      execute: async (args: any) => {
+        return { content: await savePrices(args) }
       },
     })
   })

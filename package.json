@@ -1,6 +1,6 @@
 {
   "name": "opencode-chat-cost",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "OpenCode plugin: token usage, RUB cost by configurable rates, and a work summary for each chat",
   "type": "module",
   "main": "src/index.ts",
